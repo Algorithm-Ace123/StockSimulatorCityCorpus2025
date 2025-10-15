@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1,viewport-fit=cover"
+  />
+  <title>StockSim</title>
+  <link rel="icon" href="favicon.ico" />
+  <link rel="preconnect" href="https://esm.sh" />
+  <link rel="stylesheet" href="./styles/base.css" />
+  <link rel="stylesheet" href="./styles/layout.css" />
+  <link rel="stylesheet" href="./styles/components.css" />
+  <!-- Chart.js for on-page analytics (sparklines + detail chart) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+  <!-- App boot -->
+  <script type="module" src="./src/app.js"></script>
+</head>
+<body>
+  <!-- App shell mounts here -->
+  <app-shell></app-shell>
+
+  <!-- Fallback if JS disabled -->
+  <noscript>
+    <div class="container mt-4">
+      <div class="card p-3">
+        <h2>Enable JavaScript</h2>
+        <p>This app needs JavaScript for routing and live prices.</p>
+      </div>
+    </div>
+  </noscript>
+</body>
+</html>

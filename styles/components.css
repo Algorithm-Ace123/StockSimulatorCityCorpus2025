@@ -1,0 +1,21 @@
+.card-header { display:flex; justify-content:space-between; align-items:center; padding: .9rem 1.1rem; border-bottom: 1px solid #182132; }
+.card-body { padding: 1rem; }
+.toolbar { display:flex; gap:.6rem; align-items:center; flex-wrap: wrap; }
+
+.kpi {
+  display:flex; gap:.8rem; align-items:flex-end;
+  background: linear-gradient(180deg, rgba(124,92,255,.07), rgba(0,0,0,.0));
+  border: 1px solid #2a3550; border-radius: 12px; padding: .8rem 1rem;
+}
+.kpi .v { font-weight: 700; font-size: 1.4rem; }
+.kpi .l { color:#9aa3b5; font-size:.8rem }
+
+.tag-pill {
+  font-size: .75rem; padding: .25rem .5rem; border-radius: 999px;
+  border: 1px dashed #2a3b52; color: #cbd5e1;
+}
+.toast {
+  position: fixed; bottom: 16px; right: 16px; z-index: 9999;
+  background: #0b1320; border:1px solid #20314b; color:#d9e3f1;
+  padding: .65rem .85rem; border-radius: 10px; box-shadow: var(--shadow);
+}
