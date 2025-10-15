@@ -18,26 +18,67 @@ const priceChannel = getPricesChannel(true);
 
 /* ---------- Engine tick (updates DB + broadcasts once) ---------- */
 async function runEngineTick() {
+  // 1) ALWAYS fetch the latest prices so admin nudges stick
   const { data: stocks, error } = await supabase
     .from('stocks')
-    .select('symbol,price,drift,vol,halted,name');
-  if (error) { console.error('[engine] load', error); return; }
+    .select('symbol, price, drift, vol, halted, name');
 
-  const updates = [];
-  for (const s of (stocks || [])) {
-    if (s.halted) continue;
-    let next = Number(s.price) * (1 + Number(s.drift || 0) + gaussian(0, Number(s.vol || 0.02)));
-    next = Math.max(1, round2(next));
-    const { error: upErr } = await supabase
-      .from('stocks')
-      .update({ price: next, updated_at: new Date().toISOString() })
-      .eq('symbol', s.symbol);
-    if (upErr) { console.error('[engine] update', s.symbol, upErr.message); continue; }
-    updates.push({ symbol: s.symbol, name: s.name, price: next, halted: false });
+  if (error) {
+    console.error('[engine] load', error);
+    return;
   }
 
+  const updates = [];
+  const nowIso = new Date().toISOString();
+
+  for (const s of (stocks || [])) {
+    if (s.halted) continue;
+
+    const last = Number(s.price);
+    const drift = Number(s.drift || 0);       // small bias per tick, e.g., 0.001 = +0.1%
+    const vol = Number(s.vol || 0.02);      // randomness scale per tick
+
+    // Optional: a little breath to vary volatility ±20% (comment out if not wanted)
+    const volNow = vol * (0.9 + Math.random() * 0.2);
+
+    // 2) Stochastic next price around CURRENT DB value (respects nudges)
+    let next = last * (1 + drift + gaussian(0, volNow));
+
+    // Optional safety clamps (uncomment if you want to limit single-tick shocks)
+    // next = Math.min(next, last * 2);   // cap +100% in one tick
+    // next = Math.max(next, last * 0.5); // cap -50% in one tick
+
+    // 3) Floor at ₹1 and round to paise
+    next = Math.max(1, round2(next));
+
+    // 4) Persist to DB
+    const { error: upErr } = await supabase
+      .from('stocks')
+      .update({ price: next, updated_at: nowIso })
+      .eq('symbol', s.symbol);
+
+    if (upErr) {
+      console.error('[engine] update', s.symbol, upErr.message);
+      continue;
+    }
+
+    // 5) Prepare broadcast payload for all clients
+    updates.push({
+      symbol: s.symbol,
+      name: s.name,
+      price: next,
+      halted: false,
+      updated_at: nowIso
+    });
+  }
+
+  // 6) Broadcast one compact tick to everyone (Trader + Admin UIs)
   if (updates.length) {
-    await priceChannel.send({ type: 'broadcast', event: 'tick', payload: updates });
+    await priceChannel.send({
+      type: 'broadcast',
+      event: 'tick',
+      payload: updates
+    });
   }
 }
 
@@ -97,7 +138,12 @@ export default function AdminView(root) {
         <div class="card-header"><h2>Stocks</h2></div>
         <div class="card-body">
           <table class="table" id="tbl">
-            <thead><tr><th>Symbol</th><th>Name</th><th>Price</th><th>Halted</th><th></th></tr></thead>
+            <thead>
+  <tr>
+    <th>Symbol</th><th>Name</th><th>Price</th><th>Halted</th><th>Trajectory</th><th></th>
+  </tr>
+</thead>
+
             <tbody></tbody>
           </table>
         </div>
@@ -126,14 +172,22 @@ export default function AdminView(root) {
   async function loadStocks() {
     const rows = await stocksService.listStocks();
     tbody.innerHTML = rows.map(r => `
-      <tr data-sym="${r.symbol}">
-        <td><strong>${r.symbol}</strong></td>
-        <td>${r.name}</td>
-        <td class="price">${Number(r.price).toFixed(2)}</td>
-        <td class="halt">${r.halted ? '<span class="badge badge--danger">Yes</span>' : '<span class="badge badge--ok">No</span>'}</td>
-        <td><button class="btn small" data-h="${r.symbol}">${r.halted ? 'Resume' : 'Halt'}</button></td>
-      </tr>
-    `).join('');
+  <tr data-sym="${r.symbol}">
+    <td><strong>${r.symbol}</strong></td>
+    <td>${r.name}</td>
+    <td class="price">${Number(r.price).toFixed(2)}</td>
+    <td class="halt">${r.halted ? '<span class="badge badge--danger">Yes</span>' : '<span class="badge badge--ok">No</span>'}</td>
+    <td>
+      <select class="traj" data-traj="${r.symbol}">
+        <option value="UP" ${r.trajectory === 'UP' ? 'selected' : ''}>Up</option>
+        <option value="NEUTRAL" ${r.trajectory === 'NEUTRAL' ? 'selected' : ''}>Neutral</option>
+        <option value="DOWN" ${r.trajectory === 'DOWN' ? 'selected' : ''}>Down</option>
+      </select>
+    </td>
+    <td><button class="btn small" data-h="${r.symbol}">${r.halted ? 'Resume' : 'Halt'}</button></td>
+  </tr>
+`).join('');
+
   }
   loadStocks();
 
@@ -144,21 +198,25 @@ export default function AdminView(root) {
       tr = document.createElement('tr');
       tr.setAttribute('data-sym', p.symbol);
       tr.innerHTML = `
-        <td><strong>${p.symbol}</strong></td>
-        <td>${p.name || ''}</td>
-        <td class="price">-</td>
-        <td class="halt">${p.halted ? '<span class="badge badge--danger">Yes</span>' : '<span class="badge badge--ok">No</span>'}</td>
-        <td><button class="btn small" data-h="${p.symbol}">${p.halted ? 'Resume' : 'Halt'}</button></td>
-      `;
+      <td><strong>${p.symbol}</strong></td>
+      <td>${p.name || ''}</td>
+      <td class="price">-</td>
+      <td class="halt"><span class="badge badge--ok">No</span></td>
+      <td>
+        <select class="traj" data-traj="${p.symbol}">
+          <option value="UP">Up</option>
+          <option value="NEUTRAL" selected>Neutral</option>
+          <option value="DOWN">Down</option>
+        </select>
+      </td>
+      <td><button class="btn small" data-h="${p.symbol}">Halt</button></td>
+    `;
       tbody.appendChild(tr);
     }
     tr.querySelector('.price').textContent = Number(p.price).toFixed(2);
-    tr.querySelector('.halt').innerHTML = p.halted
-      ? '<span class="badge badge--danger">Yes</span>'
-      : '<span class="badge badge--ok">No</span>';
-    const btn = tr.querySelector('button[data-h]');
-    if (btn) btn.textContent = p.halted ? 'Resume' : 'Halt';
+    // leave .halt as your existing code updates it on halts
   }
+
 
   // Listen to realtime ticks (self:true so admin also sees its own broadcasts)
   const unsubscribe = stocksService.subscribePrices(upsertRow, { self: true });
@@ -174,6 +232,27 @@ export default function AdminView(root) {
     toast(`"${symbol}" ${!s.halted ? 'halted' : 'resumed'}`);
     loadStocks();
   });
+
+  // Handle Trajectory dropdown changes
+tbody.addEventListener('change', async (e) => {
+  const sel = e.target.closest('select.traj');
+  if (!sel) return;
+  const symbol = sel.dataset.traj;
+  const trajectory = sel.value; // 'UP' | 'NEUTRAL' | 'DOWN'
+  try {
+    const { error } = await supabase
+      .from('stocks')
+      .update({ trajectory })
+      .eq('symbol', symbol);
+    if (error) throw error;
+    toast(`Trajectory for ${symbol} → ${trajectory}`);
+    // No need to broadcast; takes effect from next tick automatically
+  } catch (err) {
+    console.error(err);
+    toast('Failed to update trajectory');
+  }
+});
+
 
   // Nudge (DB update via RPC + broadcast to everyone)
   nudgeBtn.onclick = async () => {
@@ -236,7 +315,7 @@ export default function AdminView(root) {
   root.querySelector('#startEngine').onclick = () => {
     if (engTimer) return;
     runEngineTick(); // immediate tick
-    engTimer = setInterval(runEngineTick, 10_000);
+    engTimer = setInterval(runEngineTick, 5_000);
     engStatus.textContent = 'Engine running (10s)';
   };
   root.querySelector('#stopEngine').onclick = () => {
