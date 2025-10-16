@@ -1,15 +1,22 @@
 import { supabase } from './supabase.js';
 import { getPricesChannel } from './realtime.js';
 
+const { data, error } = await supabase
+  .from('stocks')
+  .select('symbol,name,price,halted,trajectory,updated_at')  // 👈 include trajectory
+  .order('symbol', { ascending: true });
+
 function rowToStock(r) {
   return {
     symbol: r.symbol,
     name: r.name,
     price: Number(r.price),
-    updated_at: r.updated_at || r.updatedAt || new Date().toISOString(),
     halted: !!r.halted,
+    trajectory: r.trajectory || 'NEUTRAL',    // 👈 default if missing
+    updated_at: r.updated_at || new Date().toISOString(),
   };
 }
+
 
 export const stocksService = {
   async listStocks() {
