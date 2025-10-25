@@ -5,6 +5,7 @@ import { usersService } from '../services/users.service.js';
 import { toast } from '../components/toast.js';
 import { supabase } from '../services/supabase.js';
 import { getPricesChannel } from '../services/realtime.js';
+import { ENV } from '../config.js';
 
 /* ---------- Small helpers ---------- */
 function gaussian(mean = 0, std = 1) {
@@ -13,72 +14,109 @@ function gaussian(mean = 0, std = 1) {
 }
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// easing for smoother glide (easeInOutQuad)
+function ease01(t) {
+  t = Math.min(1, Math.max(0, t));
+  return t < 0.5 ? 2*t*t : -1 + (4 - 2*t)*t;
+}
+
 /* ---------- One shared broadcast channel (self:true for admin) ---------- */
 const priceChannel = getPricesChannel(true);
 
-/* ---------- Engine tick (updates DB + broadcasts once) ---------- */
+/* ---------- Engine tick (reduced vol, trajectories, guided glide, OCC) ---------- */
 async function runEngineTick() {
-  // 1) ALWAYS fetch the latest prices so admin nudges stick
   const { data: stocks, error } = await supabase
     .from('stocks')
-    .select('symbol, price, drift, vol, halted, name');
+    .select(`
+      symbol, price, drift, vol, halted, name, trajectory, updated_at,
+      target_price, target_start_price, target_start_at, target_end
+    `);
 
-  if (error) {
-    console.error('[engine] load', error);
-    return;
-  }
+  if (error) { console.error('[engine] load', error); return; }
 
   const updates = [];
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
 
   for (const s of (stocks || [])) {
     if (s.halted) continue;
 
-    const last = Number(s.price);
-    const drift = Number(s.drift || 0);       // small bias per tick, e.g., 0.001 = +0.1%
-    const vol = Number(s.vol || 0.02);      // randomness scale per tick
+    const last   = Number(s.price);
+    const base   = Number(s.drift || 0);
+    const vol0   = Number(s.vol   || 0.02);
+    const volNow = vol0 * (ENV?.ENGINE?.VOL_SCALE ?? 0.30); // big reduction
 
-    // Optional: a little breath to vary volatility ±20% (comment out if not wanted)
-    const volNow = vol * (0.9 + Math.random() * 0.2);
+    // Trajectory bias with occasional opposite blips
+    const biasMag = (ENV?.ENGINE?.TREND_DRIFT ?? 0.0015);
+    let bias = 0;
+    if (s.trajectory === 'UP')   bias = +biasMag;
+    if (s.trajectory === 'DOWN') bias = -biasMag;
 
-    // 2) Stochastic next price around CURRENT DB value (respects nudges)
-    let next = last * (1 + drift + gaussian(0, volNow));
-
-    // Optional safety clamps (uncomment if you want to limit single-tick shocks)
-    // next = Math.min(next, last * 2);   // cap +100% in one tick
-    // next = Math.max(next, last * 0.5); // cap -50% in one tick
-
-    // 3) Floor at ₹1 and round to paise
-    next = Math.max(1, round2(next));
-
-    // 4) Persist to DB
-    const { error: upErr } = await supabase
-      .from('stocks')
-      .update({ price: next, updated_at: nowIso })
-      .eq('symbol', s.symbol);
-
-    if (upErr) {
-      console.error('[engine] update', s.symbol, upErr.message);
-      continue;
+    let noise = gaussian(0, volNow);
+    if (s.trajectory === 'UP' && Math.random() < (ENV?.ENGINE?.DIP_PROB_UP ?? 0.18)) {
+      noise -= Math.abs(gaussian(0, volNow * (ENV?.ENGINE?.DIP_MULT ?? 1.2)));
+    }
+    if (s.trajectory === 'DOWN' && Math.random() < (ENV?.ENGINE?.DIP_PROB_DOWN ?? 0.18)) {
+      noise += Math.abs(gaussian(0, volNow * (ENV?.ENGINE?.DIP_MULT ?? 1.2)));
     }
 
-    // 5) Prepare broadcast payload for all clients
+    let next = last * (1 + base + bias + noise);
+
+    // ===== Guided target: 0 means "no target" =====
+    const hasTarget = Number(s.target_price || 0) !== 0
+                   && s.target_end && s.target_start_price && s.target_start_at;
+
+    if (hasTarget) {
+      const tStart = new Date(s.target_start_at).getTime();
+      const tEnd   = new Date(s.target_end).getTime();
+      const tNow   = now.getTime();
+
+      if (tNow < tEnd) {
+        const frac = ease01((tNow - tStart) / (tEnd - tStart)); // 0..1 eased
+        const guide = Number(s.target_start_price)
+                    + (Number(s.target_price) - Number(s.target_start_price)) * frac;
+        const guideNoise = gaussian(0, volNow * 0.4); // even softer while guiding
+        next = Math.max(1, round2(guide * (1 + guideNoise)));
+      } else {
+        // Reached target: snap to target and CLEAR fields back to 0
+        next = Math.max(1, round2(Number(s.target_price)));
+
+        const { error: clrErr } = await supabase
+          .from('stocks')
+          .update({
+            target_price: 0,
+            target_start_price: 0,
+            target_start_at: null,
+            target_end: null
+          })
+          .eq('symbol', s.symbol);
+        if (clrErr) console.error('[engine] clear target', s.symbol, clrErr.message);
+      }
+    }
+
+    // Optimistic concurrency: if someone updated after we read, skip
+    const { data: wrote, error: upErr } = await supabase
+      .from('stocks')
+      .update({ price: next, updated_at: nowIso })
+      .eq('symbol', s.symbol)
+      .eq('updated_at', s.updated_at)
+      .select('symbol');
+
+    if (upErr) { console.error('[engine] update', s.symbol, upErr.message); continue; }
+    if (!wrote || wrote.length === 0) continue; // another newer update; don't overwrite
+
     updates.push({
       symbol: s.symbol,
       name: s.name,
       price: next,
       halted: false,
+      trajectory: s.trajectory,
       updated_at: nowIso
     });
   }
 
-  // 6) Broadcast one compact tick to everyone (Trader + Admin UIs)
   if (updates.length) {
-    await priceChannel.send({
-      type: 'broadcast',
-      event: 'tick',
-      payload: updates
-    });
+    await priceChannel.send({ type: 'broadcast', event: 'tick', payload: updates });
   }
 }
 
@@ -88,13 +126,13 @@ export default function AdminView(root) {
     <div class="grid grid-2">
       <section class="card">
         <div class="card-header"><h2>Controls</h2></div>
-        <div class="card-body grid" style="grid-template-columns: 1fr 1fr; gap: .9rem;">
+        <div class="card-body grid" style="grid-template-columns: 1fr 1fr; gap:.9rem;">
 
           <div class="card p-3" style="border-radius:12px;">
             <h3>Nudge Price</h3>
             <div class="small">Apply a +/- percentage to a symbol on next update.</div>
             <div class="mt-3 grid" style="grid-template-columns: 1fr 1fr 1fr; gap:.6rem;">
-              <input id="sym" placeholder="SYM e.g. ABX" />
+              <input id="sym" placeholder="SYM e.g. RELIANCE" />
               <input id="pct" type="number" step="0.01" placeholder="0.05 = +5%" />
               <button id="nudge" class="btn btn--accent">Apply</button>
             </div>
@@ -110,23 +148,15 @@ export default function AdminView(root) {
             </div>
           </div>
 
-          <div class="card p-3" style="border-radius:12px; grid-column: span 2;">
-            <h3>Allocate Cash</h3>
-            <div class="small">Find by email, then add/subtract cash (₹).</div>
-            <div class="mt-3 grid" style="grid-template-columns: 2fr 1fr 1fr; gap:.6rem;">
-              <input id="email" type="email" placeholder="player@example.com" />
-              <input id="delta" type="number" step="1" placeholder="Amount (e.g. 5000)" />
-              <button id="cash" class="btn">Apply</button>
-            </div>
-            <div id="cashResult" class="small mt-2"></div>
-          </div>
-
           <div class="card p-3" style="border-radius:12px;">
             <h3>Price Engine</h3>
             <div class="small">Runs in this browser tab. Keep it open during the fest.</div>
-            <div class="mt-3 flex">
+            <div class="mt-3 flex" style="align-items:center; gap:.7rem;">
               <button id="startEngine" class="btn btn--accent">Start</button>
-              <button id="stopEngine" class="btn btn--danger">Stop</button>
+              <button id="stopEngine"  class="btn btn--danger">Stop</button>
+              <label class="small">Interval (s):
+                <input id="tickInterval" type="number" min="2" step="1" value="${(ENV?.ENGINE?.DEFAULT_TICK_MS ?? 5000)/1000}" style="width:70px; margin-left:.3rem;">
+              </label>
               <span id="engStatus" class="small"></span>
             </div>
           </div>
@@ -139,11 +169,10 @@ export default function AdminView(root) {
         <div class="card-body">
           <table class="table" id="tbl">
             <thead>
-  <tr>
-    <th>Symbol</th><th>Name</th><th>Price</th><th>Halted</th><th>Trajectory</th><th></th>
-  </tr>
-</thead>
-
+              <tr>
+                <th>Symbol</th><th>Name</th><th>Price</th><th>Halted</th><th>Trajectory</th><th>Target</th><th></th>
+              </tr>
+            </thead>
             <tbody></tbody>
           </table>
         </div>
@@ -152,109 +181,178 @@ export default function AdminView(root) {
   `;
 
   const tbody = root.querySelector('#tbl tbody');
-  const sym = root.querySelector('#sym');
-  const pct = root.querySelector('#pct');
+  const sym   = root.querySelector('#sym');
+  const pct   = root.querySelector('#pct');
   const nudgeBtn = root.querySelector('#nudge');
 
   const symH = root.querySelector('#symH');
   const selH = root.querySelector('#halted');
   const haltBtn = root.querySelector('#halt');
 
-  const email = root.querySelector('#email');
-  const delta = root.querySelector('#delta');
-  const cashBtn = root.querySelector('#cash');
-  const cashResult = root.querySelector('#cashResult');
-
   const engStatus = root.querySelector('#engStatus');
+  const tickInput = root.querySelector('#tickInterval');
+
   let engTimer = null;
+  let tickMs   = Math.max(2000, Number(tickInput.value) * 1000);
+
+  tickInput.addEventListener('change', () => {
+    tickMs = Math.max(2000, Number(tickInput.value) * 1000);
+    engStatus.textContent = `Next tick every ${tickMs/1000}s`;
+  });
 
   // Draw table initially
   async function loadStocks() {
     const rows = await stocksService.listStocks();
     tbody.innerHTML = rows.map(r => `
-  <tr data-sym="${r.symbol}">
-    <td><strong>${r.symbol}</strong></td>
-    <td>${r.name}</td>
-    <td class="price">${Number(r.price).toFixed(2)}</td>
-    <td class="halt">${r.halted ? '<span class="badge badge--danger">Yes</span>' : '<span class="badge badge--ok">No</span>'}</td>
-    <td>
-      <select class="traj" data-traj="${r.symbol}">
-        <option value="UP" ${r.trajectory === 'UP' ? 'selected' : ''}>Up</option>
-        <option value="NEUTRAL" ${r.trajectory === 'NEUTRAL' ? 'selected' : ''}>Neutral</option>
-        <option value="DOWN" ${r.trajectory === 'DOWN' ? 'selected' : ''}>Down</option>
-      </select>
-    </td>
-    <td><button class="btn small" data-h="${r.symbol}">${r.halted ? 'Resume' : 'Halt'}</button></td>
-  </tr>
-`).join('');
+      <tr data-sym="${r.symbol}">
+        <td><strong>${r.symbol}</strong></td>
+        <td>${r.name}</td>
+        <td class="price">${Number(r.price).toFixed(2)}</td>
+        <td class="halt">${r.halted ? '<span class="badge badge--danger">Yes</span>' : '<span class="badge badge--ok">No</span>'}</td>
+        <td>
+          <select class="traj" data-traj="${r.symbol}">
+            <option value="UP">Up</option>
+            <option value="NEUTRAL">Neutral</option>
+            <option value="DOWN">Down</option>
+          </select>
+        </td>
+        <td class="small">
+          <input class="tprice" data-tp="${r.symbol}" type="number" step="0.01" placeholder="₹ target" style="width:105px;">
+          <input class="tsecs"  data-ts="${r.symbol}" type="number" min="1"  placeholder="secs"      style="width:80px;">
+          <button class="btn small" data-target="${r.symbol}">Set</button>
+          <button class="btn small" data-cleartarget="${r.symbol}">Clear</button>
+        </td>
+        <td><button class="btn small" data-h="${r.symbol}">${r.halted ? 'Resume' : 'Halt'}</button></td>
+      </tr>
+    `).join('');
 
+    // Explicitly apply the existing trajectory to each select
+    rows.forEach(r => {
+      const sel = tbody.querySelector(`select.traj[data-traj="${r.symbol}"]`);
+      if (sel) sel.value = r.trajectory || 'NEUTRAL';
+    });
   }
   loadStocks();
 
-  // Upsert helper for table rows
+  // Upsert helper for updates via broadcast
   function upsertRow(p) {
     let tr = tbody.querySelector(`[data-sym="${p.symbol}"]`);
     if (!tr) {
       tr = document.createElement('tr');
       tr.setAttribute('data-sym', p.symbol);
       tr.innerHTML = `
-      <td><strong>${p.symbol}</strong></td>
-      <td>${p.name || ''}</td>
-      <td class="price">-</td>
-      <td class="halt"><span class="badge badge--ok">No</span></td>
-      <td>
-        <select class="traj" data-traj="${p.symbol}">
-          <option value="UP">Up</option>
-          <option value="NEUTRAL" selected>Neutral</option>
-          <option value="DOWN">Down</option>
-        </select>
-      </td>
-      <td><button class="btn small" data-h="${p.symbol}">Halt</button></td>
-    `;
+        <td><strong>${p.symbol}</strong></td>
+        <td>${p.name || ''}</td>
+        <td class="price">-</td>
+        <td class="halt"><span class="badge badge--ok">No</span></td>
+        <td>
+          <select class="traj" data-traj="${p.symbol}">
+            <option value="UP">Up</option>
+            <option value="NEUTRAL" selected>Neutral</option>
+            <option value="DOWN">Down</option>
+          </select>
+        </td>
+        <td class="small">
+          <input class="tprice" data-tp="${p.symbol}" type="number" step="0.01" placeholder="₹ target" style="width:105px;">
+          <input class="tsecs"  data-ts="${p.symbol}" type="number" min="1"  placeholder="secs"      style="width:80px;">
+          <button class="btn small" data-target="${p.symbol}">Set</button>
+          <button class="btn small" data-cleartarget="${p.symbol}">Clear</button>
+        </td>
+        <td><button class="btn small" data-h="${p.symbol}">Halt</button></td>
+      `;
       tbody.appendChild(tr);
     }
     tr.querySelector('.price').textContent = Number(p.price).toFixed(2);
-    // leave .halt as your existing code updates it on halts
+    const sel = tr.querySelector('select.traj');
+    if (sel && p.trajectory) sel.value = p.trajectory;
+    const btn = tr.querySelector('button[data-h]');
+    if (btn) btn.textContent = p.halted ? 'Resume' : 'Halt';
   }
 
-
-  // Listen to realtime ticks (self:true so admin also sees its own broadcasts)
+  // Listen to realtime ticks (self:true so admin sees own broadcasts)
   const unsubscribe = stocksService.subscribePrices(upsertRow, { self: true });
 
-  // Row halt toggle
+  // --- Row actions ---
+  // Halt toggle
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-h]');
     if (!btn) return;
     const symbol = btn.getAttribute('data-h');
-    const rows = await stocksService.listStocks();
-    const s = rows.find(x => x.symbol === symbol);
-    await adminService.setHalted(symbol, !s.halted);
-    toast(`"${symbol}" ${!s.halted ? 'halted' : 'resumed'}`);
+
+    const { data: srow } = await supabase.from('stocks').select('halted').eq('symbol', symbol).single();
+    const nextH = !srow?.halted;
+    const { error } = await supabase.from('stocks').update({ halted: nextH }).eq('symbol', symbol);
+    if (error) { toast('Failed to update halt'); return; }
+
+    toast(`${nextH ? 'Halted' : 'Resumed'} ${symbol}`);
     loadStocks();
   });
 
-  // Handle Trajectory dropdown changes
-tbody.addEventListener('change', async (e) => {
-  const sel = e.target.closest('select.traj');
-  if (!sel) return;
-  const symbol = sel.dataset.traj;
-  const trajectory = sel.value; // 'UP' | 'NEUTRAL' | 'DOWN'
-  try {
+  // Trajectory change
+  tbody.addEventListener('change', async (e) => {
+    const sel = e.target.closest('select.traj');
+    if (!sel) return;
+    const symbol = sel.dataset.traj;
+    const trajectory = sel.value;
+    const { error } = await supabase.from('stocks').update({ trajectory }).eq('symbol', symbol);
+    if (error) { toast('Failed to update trajectory'); return; }
+    toast(`Trajectory for ${symbol} → ${trajectory}`);
+  });
+
+  // Set target (glide to price in N seconds)
+  tbody.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-target]');
+    if (!btn) return;
+    const symbol = btn.getAttribute('data-target');
+    const priceEl = tbody.querySelector(`input.tprice[data-tp="${symbol}"]`);
+    const secsEl  = tbody.querySelector(`input.tsecs[data-ts="${symbol}"]`);
+    const target  = Number(priceEl?.value);
+    const secs    = Number(secsEl?.value);
+
+    if (!target || !secs) { toast('Enter target price and seconds'); return; }
+
+    const { data: cur, error: seErr } = await supabase
+      .from('stocks').select('price').eq('symbol', symbol).single();
+    if (seErr) { toast('Failed to read price'); return; }
+
+    const now = new Date();
+    const end = new Date(now.getTime() + secs * 1000);
+
     const { error } = await supabase
       .from('stocks')
-      .update({ trajectory })
+      .update({
+        target_price: target,
+        target_start_price: Number(cur.price),
+        target_start_at: now.toISOString(),
+        target_end: end.toISOString()
+      })
       .eq('symbol', symbol);
-    if (error) throw error;
-    toast(`Trajectory for ${symbol} → ${trajectory}`);
-    // No need to broadcast; takes effect from next tick automatically
-  } catch (err) {
-    console.error(err);
-    toast('Failed to update trajectory');
-  }
-});
 
+    if (error) { toast('Failed to set target'); return; }
+    toast(`Target set: ${symbol} → ₹${target.toFixed(2)} in ${secs}s`);
+  });
 
-  // Nudge (DB update via RPC + broadcast to everyone)
+  // Clear target (immediately)
+  tbody.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-cleartarget]');
+    if (!btn) return;
+    const symbol = btn.getAttribute('data-cleartarget');
+
+    const { error } = await supabase
+      .from('stocks')
+      .update({
+        target_price: 0,
+        target_start_price: 0,
+        target_start_at: null,
+        target_end: null
+      })
+      .eq('symbol', symbol);
+
+    if (error) { toast('Failed to clear target'); return; }
+    toast(`Target cleared for ${symbol}`);
+  });
+
+  // Nudge (RPC + broadcast)
   nudgeBtn.onclick = async () => {
     try {
       const s = sym.value.trim().toUpperCase();
@@ -262,11 +360,11 @@ tbody.addEventListener('change', async (e) => {
       if (!s) return toast('Enter symbol');
       if (!p) return toast('Enter percent e.g. 0.05');
 
-      const row = await adminService.nudgePercent(s, p);
+      const row = await adminService.nudgePercent(s, p); // updates DB via RPC
       await priceChannel.send({
         type: 'broadcast',
         event: 'tick',
-        payload: [{ symbol: row.symbol, name: row.name, price: Number(row.price), halted: row.halted }]
+        payload: [{ symbol: row.symbol, name: row.name, price: Number(row.price), halted: row.halted, trajectory: row.trajectory }]
       });
 
       toast(`Nudged ${s} by ${(p * 100).toFixed(2)}%`);
@@ -276,47 +374,12 @@ tbody.addEventListener('change', async (e) => {
     }
   };
 
-  // Halt/Resume
-  haltBtn.onclick = async () => {
-    try {
-      const s = symH.value.trim().toUpperCase();
-      const h = selH.value === 'true';
-      if (!s) return toast('Enter symbol');
-      await adminService.setHalted(s, h);
-      toast(`${h ? 'Halted' : 'Resumed'} ${s}`);
-      loadStocks();
-    } catch (err) {
-      console.error(err); toast('Update failed');
-    }
-  };
-
-  // Cash allocate
-  cashBtn.onclick = async () => {
-    try {
-      const u = await usersService.findByEmail(email.value.trim());
-      if (!u) { cashResult.textContent = 'No user found for that email.'; return; }
-      const amt = Number(delta.value);
-      if (!amt) { cashResult.textContent = 'Enter amount.'; return; }
-
-      const { data, error } = await supabase.rpc('add_cash', { p_user_id: u.id, p_delta: amt });
-      if (error) throw error;
-
-      cashResult.textContent = `Updated. New cash: ₹${Number(data?.cash || 0).toFixed(2)}`;
-      toast('Cash updated');
-      email.value = ''; delta.value = '';
-    } catch (err) {
-      console.error(err);
-      cashResult.textContent = 'Failed to update cash.';
-      toast('Cash update failed');
-    }
-  };
-
   // Engine Start/Stop
   root.querySelector('#startEngine').onclick = () => {
     if (engTimer) return;
     runEngineTick(); // immediate tick
-    engTimer = setInterval(runEngineTick, 5_000);
-    engStatus.textContent = 'Engine running (10s)';
+    engTimer = setInterval(runEngineTick, tickMs);
+    engStatus.textContent = `Engine running (${tickMs/1000}s)`;
   };
   root.querySelector('#stopEngine').onclick = () => {
     if (engTimer) clearInterval(engTimer);
