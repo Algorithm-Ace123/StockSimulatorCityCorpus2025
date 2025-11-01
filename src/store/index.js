@@ -2,6 +2,8 @@
 const state = new Map();
 const subs = new Map();
 
+
+
 function notify(key) {
   const val = state.get(key);
   (subs.get(key) || []).forEach(cb => cb(val));

@@ -1,29 +1,28 @@
 // src/views/admin.view.js
 import { stocksService } from '../services/stocks.service.js';
 import { adminService } from '../services/admin.service.js';
-import { usersService } from '../services/users.service.js';
 import { toast } from '../components/toast.js';
 import { supabase } from '../services/supabase.js';
 import { getPricesChannel } from '../services/realtime.js';
 import { ENV } from '../config.js';
 
-/* ---------- Small helpers ---------- */
+/* ---------- Helpers ---------- */
 function gaussian(mean = 0, std = 1) {
   let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random();
   return mean + std * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 const round2 = (n) => Math.round(n * 100) / 100;
 
-// easing for smoother glide (easeInOutQuad)
-function ease01(t) {
+/** Smoothstep 0..1 -> 0..1 (gentle start & finish; no late jump) */
+function smoothstep01(t) {
   t = Math.min(1, Math.max(0, t));
-  return t < 0.5 ? 2*t*t : -1 + (4 - 2*t)*t;
+  return t * t * (3 - 2 * t);
 }
 
 /* ---------- One shared broadcast channel (self:true for admin) ---------- */
 const priceChannel = getPricesChannel(true);
 
-/* ---------- Engine tick (reduced vol, trajectories, guided glide, OCC) ---------- */
+/* ---------- Engine tick (neutral/up/down gentle; target = exact time glide) ---------- */
 async function runEngineTick() {
   const { data: stocks, error } = await supabase
     .from('stocks')
@@ -38,33 +37,24 @@ async function runEngineTick() {
   const now = new Date();
   const nowIso = now.toISOString();
 
+  // constants from config (for normal mode only)
+  const VOL_SCALE    = ENV?.ENGINE?.VOL_SCALE ?? 0.02;
+  const NOISE_MULT   = ENV?.ENGINE?.NOISE_MULT ?? 0.12;
+  const MAX_STEP     = ENV?.ENGINE?.MAX_SINGLE_TICK_PCT ?? 0.0015;
+  const BIAS_PCT     = ENV?.ENGINE?.BIAS_PCT ?? 0.0006;
+
   for (const s of (stocks || [])) {
     if (s.halted) continue;
 
-    const last   = Number(s.price);
-    const base   = Number(s.drift || 0);
-    const vol0   = Number(s.vol   || 0.02);
-    const volNow = vol0 * (ENV?.ENGINE?.VOL_SCALE ?? 0.30); // big reduction
+    const last = Number(s.price);
+    let next   = last; // will set below
 
-    // Trajectory bias with occasional opposite blips
-    const biasMag = (ENV?.ENGINE?.TREND_DRIFT ?? 0.0015);
-    let bias = 0;
-    if (s.trajectory === 'UP')   bias = +biasMag;
-    if (s.trajectory === 'DOWN') bias = -biasMag;
-
-    let noise = gaussian(0, volNow);
-    if (s.trajectory === 'UP' && Math.random() < (ENV?.ENGINE?.DIP_PROB_UP ?? 0.18)) {
-      noise -= Math.abs(gaussian(0, volNow * (ENV?.ENGINE?.DIP_MULT ?? 1.2)));
-    }
-    if (s.trajectory === 'DOWN' && Math.random() < (ENV?.ENGINE?.DIP_PROB_DOWN ?? 0.18)) {
-      noise += Math.abs(gaussian(0, volNow * (ENV?.ENGINE?.DIP_MULT ?? 1.2)));
-    }
-
-    let next = last * (1 + base + bias + noise);
-
-    // ===== Guided target: 0 means "no target" =====
-    const hasTarget = Number(s.target_price || 0) !== 0
-                   && s.target_end && s.target_start_price && s.target_start_at;
+    // ===== Target glide path (authoritative, time-based) =====
+    const hasTarget =
+      Number(s.target_price || 0) !== 0 &&
+      s.target_start_price != null &&
+      s.target_start_at != null &&
+      s.target_end != null;
 
     if (hasTarget) {
       const tStart = new Date(s.target_start_at).getTime();
@@ -72,15 +62,24 @@ async function runEngineTick() {
       const tNow   = now.getTime();
 
       if (tNow < tEnd) {
-        const frac = ease01((tNow - tStart) / (tEnd - tStart)); // 0..1 eased
-        const guide = Number(s.target_start_price)
-                    + (Number(s.target_price) - Number(s.target_start_price)) * frac;
-        const guideNoise = gaussian(0, volNow * 0.4); // even softer while guiding
-        next = Math.max(1, round2(guide * (1 + guideNoise)));
-      } else {
-        // Reached target: snap to target and CLEAR fields back to 0
-        next = Math.max(1, round2(Number(s.target_price)));
+        // fraction elapsed 0..1
+        const lin  = (tNow - tStart) / (tEnd - tStart);
+        const frac = smoothstep01(lin);
 
+        const start = Number(s.target_start_price);
+        const target= Number(s.target_price);
+
+        // EXACT guide value for this moment (no random, no clamp)
+        next = start + (target - start) * frac;
+
+        // keep monotonic towards target and round to paise
+        if (target > start) next = Math.max(next, last); // rising
+        else                next = Math.min(next, last); // falling
+
+        next = round2(next);
+      } else {
+        // Done: snap to target exactly and clear to "no target" (0)
+        next = round2(Number(s.target_price));
         const { error: clrErr } = await supabase
           .from('stocks')
           .update({
@@ -92,9 +91,32 @@ async function runEngineTick() {
           .eq('symbol', s.symbol);
         if (clrErr) console.error('[engine] clear target', s.symbol, clrErr.message);
       }
+    } else {
+      // ===== Normal mode: very low noise + gentle bias; keep neutral flat =====
+      const base = Number(s.drift || 0);
+      const vol0 = Number(s.vol   || 0.02);
+
+      // ultra-low noise
+      const volNow = vol0 * VOL_SCALE;
+      const noise  = gaussian(0, volNow) * NOISE_MULT;
+
+      // gentle bias by trajectory
+      let bias = 0;
+      if (s.trajectory === 'UP')   bias = +BIAS_PCT;
+      if (s.trajectory === 'DOWN') bias = -BIAS_PCT;
+      // NEUTRAL → bias = 0
+
+      let proposed = last * (1 + base + bias + noise);
+
+      // hard clamp per tick in normal mode only
+      const upCap   = last * (1 + MAX_STEP);
+      const downCap = last * (1 - MAX_STEP);
+      proposed = Math.min(upCap, Math.max(downCap, proposed));
+
+      next = round2(Math.max(1, proposed));
     }
 
-    // Optimistic concurrency: if someone updated after we read, skip
+    // ===== optimistic concurrency: only write if row unchanged since read =====
     const { data: wrote, error: upErr } = await supabase
       .from('stocks')
       .update({ price: next, updated_at: nowIso })
@@ -103,7 +125,7 @@ async function runEngineTick() {
       .select('symbol');
 
     if (upErr) { console.error('[engine] update', s.symbol, upErr.message); continue; }
-    if (!wrote || wrote.length === 0) continue; // another newer update; don't overwrite
+    if (!wrote || wrote.length === 0) continue;
 
     updates.push({
       symbol: s.symbol,
@@ -155,10 +177,23 @@ export default function AdminView(root) {
               <button id="startEngine" class="btn btn--accent">Start</button>
               <button id="stopEngine"  class="btn btn--danger">Stop</button>
               <label class="small">Interval (s):
-                <input id="tickInterval" type="number" min="2" step="1" value="${(ENV?.ENGINE?.DEFAULT_TICK_MS ?? 5000)/1000}" style="width:70px; margin-left:.3rem;">
+                <input id="tickInterval" type="number" min="2" step="1"
+                       value="${(ENV?.ENGINE?.DEFAULT_TICK_MS ?? 3000)/1000}"
+                       style="width:70px; margin-left:.3rem;">
               </label>
               <span id="engStatus" class="small"></span>
             </div>
+          </div>
+
+          <div class="card p-3" style="border-radius:12px; grid-column: span 2;">
+            <h3>Allocate Cash</h3>
+            <div class="small">Add (+) or deduct (−) money from a player by email.</div>
+            <div class="mt-3 grid" style="grid-template-columns: 2fr 1fr 1fr; gap:.6rem;">
+              <input id="email" type="email" placeholder="player@example.com" />
+              <input id="delta" type="number" step="1" placeholder="Amount (e.g. 5000 or -2000)" />
+              <button id="cash" class="btn">Apply</button>
+            </div>
+            <div id="cashResult" class="small mt-2"></div>
           </div>
 
         </div>
@@ -180,14 +215,19 @@ export default function AdminView(root) {
     </div>
   `;
 
-  const tbody = root.querySelector('#tbl tbody');
-  const sym   = root.querySelector('#sym');
-  const pct   = root.querySelector('#pct');
-  const nudgeBtn = root.querySelector('#nudge');
+  const tbody     = root.querySelector('#tbl tbody');
+  const sym       = root.querySelector('#sym');
+  const pct       = root.querySelector('#pct');
+  const nudgeBtn  = root.querySelector('#nudge');
 
-  const symH = root.querySelector('#symH');
-  const selH = root.querySelector('#halted');
-  const haltBtn = root.querySelector('#halt');
+  const symH      = root.querySelector('#symH');
+  const selH      = root.querySelector('#halted');
+  const haltBtn   = root.querySelector('#halt');
+
+  const email     = root.querySelector('#email');
+  const delta     = root.querySelector('#delta');
+  const cashBtn   = root.querySelector('#cash');
+  const cashResult= root.querySelector('#cashResult');
 
   const engStatus = root.querySelector('#engStatus');
   const tickInput = root.querySelector('#tickInterval');
@@ -200,7 +240,7 @@ export default function AdminView(root) {
     engStatus.textContent = `Next tick every ${tickMs/1000}s`;
   });
 
-  // Draw table initially
+  // Initial table
   async function loadStocks() {
     const rows = await stocksService.listStocks();
     tbody.innerHTML = rows.map(r => `
@@ -226,7 +266,6 @@ export default function AdminView(root) {
       </tr>
     `).join('');
 
-    // Explicitly apply the existing trajectory to each select
     rows.forEach(r => {
       const sel = tbody.querySelector(`select.traj[data-traj="${r.symbol}"]`);
       if (sel) sel.value = r.trajectory || 'NEUTRAL';
@@ -234,7 +273,7 @@ export default function AdminView(root) {
   }
   loadStocks();
 
-  // Upsert helper for updates via broadcast
+  // Upsert helper for broadcast updates
   function upsertRow(p) {
     let tr = tbody.querySelector(`[data-sym="${p.symbol}"]`);
     if (!tr) {
@@ -269,7 +308,7 @@ export default function AdminView(root) {
     if (btn) btn.textContent = p.halted ? 'Resume' : 'Halt';
   }
 
-  // Listen to realtime ticks (self:true so admin sees own broadcasts)
+  // Realtime listen
   const unsubscribe = stocksService.subscribePrices(upsertRow, { self: true });
 
   // --- Row actions ---
@@ -332,7 +371,7 @@ export default function AdminView(root) {
     toast(`Target set: ${symbol} → ₹${target.toFixed(2)} in ${secs}s`);
   });
 
-  // Clear target (immediately)
+  // Clear target immediately (sets target back to 0)
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-cleartarget]');
     if (!btn) return;
@@ -351,6 +390,29 @@ export default function AdminView(root) {
     if (error) { toast('Failed to clear target'); return; }
     toast(`Target cleared for ${symbol}`);
   });
+
+  // Allocate Cash (+/-) — expects RPC add_cash_by_email(p_email text, p_delta numeric)
+  cashBtn.onclick = async () => {
+    try {
+      const em  = email.value.trim();
+      const amt = Number(delta.value);
+      if (!em)  { cashResult.textContent = 'Enter an email.'; return; }
+      if (!amt) { cashResult.textContent = 'Enter a non-zero amount.'; return; }
+
+      const { data, error } = await supabase.rpc('add_cash_by_email', {
+        p_email: em, p_delta: amt
+      });
+      if (error) throw error;
+
+      cashResult.textContent = `Updated. New cash: ₹${Number(data?.cash || 0).toFixed(2)}`;
+      toast('Cash updated');
+      email.value = ''; delta.value = '';
+    } catch (err) {
+      console.error(err);
+      cashResult.textContent = 'Failed to update cash.';
+      toast(err?.message || 'Cash update failed');
+    }
+  };
 
   // Nudge (RPC + broadcast)
   nudgeBtn.onclick = async () => {
@@ -377,7 +439,7 @@ export default function AdminView(root) {
   // Engine Start/Stop
   root.querySelector('#startEngine').onclick = () => {
     if (engTimer) return;
-    runEngineTick(); // immediate tick
+    runEngineTick(); // immediate
     engTimer = setInterval(runEngineTick, tickMs);
     engStatus.textContent = `Engine running (${tickMs/1000}s)`;
   };
@@ -387,7 +449,7 @@ export default function AdminView(root) {
     engStatus.textContent = 'Engine stopped';
   };
 
-  // Cleanup on unmount
+  // Cleanup
   root.oncleanup = () => {
     unsubscribe && unsubscribe();
     if (engTimer) clearInterval(engTimer);

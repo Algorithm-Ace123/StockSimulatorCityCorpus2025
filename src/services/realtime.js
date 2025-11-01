@@ -12,7 +12,7 @@ export function getPricesChannel(self = false) {
       console.log('[prices channel]', status, `(self=${self})`)
     );
   } else {
-    // If we now need self=true and it was false, rejoin to receive our own emits.
+    // If we now need self=true and it was false, rejoin to receive own broadcasts.
     const currentSelf = pricesChannel.params?.config?.broadcast?.self ?? false;
     if (self && !currentSelf) {
       supabase.removeChannel(pricesChannel);

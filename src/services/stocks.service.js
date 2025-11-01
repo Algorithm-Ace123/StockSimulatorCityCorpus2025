@@ -22,7 +22,7 @@ export const stocksService = {
     return (data || []).map(rowToStock);
   },
 
-  /** Subscribe to broadcast ticks. opts.self=true in Admin to receive own emits. */
+  /** Subscribe to price broadcasts. Pass { self:true } in Admin so it sees its own broadcasts. */
   subscribePrices(onRow, { self = false } = {}) {
     const channel = getPricesChannel(self);
 

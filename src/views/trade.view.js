@@ -134,3 +134,4 @@ export default async function TradeView(root){
     unsubSel && unsubSel();
   };
 }
+

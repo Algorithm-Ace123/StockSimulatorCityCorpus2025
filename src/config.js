@@ -15,11 +15,20 @@ export const ENV = {
   },
 
   ENGINE: {
-    DEFAULT_TICK_MS: 5000, // 5s
-    VOL_SCALE: 0.30,       // 70% reduction in normal jiggle (multiply per-stock vol)
-    TREND_DRIFT: 0.0015,   // ≈ +0.15%/tick for UP, -0.15% for DOWN
-    DIP_PROB_UP: 0.18,     // UP: occasional small dip probability
-    DIP_PROB_DOWN: 0.18,   // DOWN: occasional small pop probability
-    DIP_MULT: 1.2          // dip/pop size multiplier
+    // ===== Timing =====
+    DEFAULT_TICK_MS: 3000,      // refresh every 3s
+
+    // ===== Normal fluctuation (ultra low) =====
+    VOL_SCALE: 0.02,            // 98% reduction of per-stock vol
+    NOISE_MULT: 0.12,           // small gaussian amplitude
+    MAX_SINGLE_TICK_PCT: 0.0015,// ±0.15% per 3s hard cap (normal mode only)
+
+    // ===== Trajectory bias (gentle slope per tick) =====
+    BIAS_PCT: 0.0006,           // ≈ ±0.06% per 3s for UP/DOWN
+
+    // ===== Target glide =====
+    // While a target is active we follow a time-based smooth curve EXACTLY,
+    // with zero random noise and no clamp. This guarantees on-time arrival.
+    GUIDE_EASING: 'smoothstep', // (kept for clarity; only smoothstep is used)
   }
 };
